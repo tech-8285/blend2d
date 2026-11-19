@@ -2439,6 +2439,13 @@ static BL_INLINE BLResult enqueue_command(
   }
 
   command_finalizer(command);
+
+  // Commands that retain a mask (mask image or mask fetch-data) must be marked so the retained
+  // data is released during batch finalization, even when the style itself is solid (in which
+  // case the command would not be marked otherwise).
+  if (command->retains_mask())
+    mgr._command_appender.mark_fetch_data();
+
   mgr.command_appender().initQuantizedY0(qy0);
   mgr.command_appender().advance();
   mark_queue_full_or_exhausted(ctx_impl, mgr._command_appender.full());
@@ -3170,6 +3177,7 @@ BL_NOINLINE BLResult fill_clipped_box_masked_a<kAsync>(
 
   return enqueue_command(ctx_impl, command, qy0, ds.fetch_data, [&](RenderCommand* command) noexcept {
     ObjectInternal::retain_impl<RCMode::kMaybe>(command->_payload.box_mask_a.mask_image_i.ptr);
+    command->add_flags(RenderCommandFlags::kRetainsMaskImageData);
   });
 }
 
@@ -3590,6 +3598,129 @@ static BLResult BL_CDECL fill_text_op_i_ext_impl(BLContextImpl* base_impl, const
 // bl::RasterEngine - ContextImpl - Frontend - Fill Mask
 // =====================================================
 
+//! Fetches a single byte of a mask image at `[x, y]`, returns zero if `[x, y]` is outside of
+//! the mask sampling bounds `[sx0, sy0, sx1, sy1)`.
+static BL_INLINE uint32_t fetch_mask_byte_zero_padded(const uint8_t* pixel_data, intptr_t stride, uint32_t bpp, int x, int y, int sx0, int sy0, int sx1, int sy1) noexcept {
+  if (unsigned(x - sx0) < unsigned(sx1 - sx0) && unsigned(y - sy0) < unsigned(sy1 - sy0))
+    return pixel_data[intptr_t(y) * stride + uint32_t(x) * bpp];
+  return 0;
+}
+
+//! Renders an A8 mask that has a fractional origin, is clipped by a non-pixel-aligned clip box,
+//! or is transformed by a complex transformation (scaling, rotation, skewing, ...).
+//!
+//! The mask is resampled into a temporary pixel-aligned A8 image by using bilinear interpolation
+//! combined with analytic coverage of the fractional clip box, and then composited through the
+//! regular masked-fill pipeline. This guarantees that solid, gradient, and pattern styles as well
+//! as clipping, global alpha, and the active composition operator are combined exactly like in
+//! the pixel-aligned case, and that synchronous and asynchronous rendering produce identical
+//! results.
+template<RenderingMode kRM>
+static BLResult fill_transformed_mask_d(BLRasterContextImpl* ctx_impl, DispatchInfo di, DispatchStyle ds, BLPoint dst, const BLImageCore* mask, BLRectI mask_rect) noexcept {
+  const BLMatrix2D& t = ctx_impl->final_transform();
+
+  // Bounding box of the transformed mask quad in device coordinates.
+  double x1 = dst.x + double(mask_rect.w);
+  double y1 = dst.y + double(mask_rect.h);
+
+  BLPoint p0 = t.map_point(dst.x, dst.y);
+  BLPoint p1 = t.map_point(x1   , dst.y);
+  BLPoint p2 = t.map_point(dst.x, y1   );
+  BLPoint p3 = t.map_point(x1   , y1   );
+
+  const BLBox& clip_box_d = ctx_impl->final_clip_box_d();
+
+  double bx0 = bl_max(bl_min(bl_min(p0.x, p1.x), bl_min(p2.x, p3.x)), clip_box_d.x0);
+  double by0 = bl_max(bl_min(bl_min(p0.y, p1.y), bl_min(p2.y, p3.y)), clip_box_d.y0);
+  double bx1 = bl_min(bl_max(bl_max(p0.x, p1.x), bl_max(p2.x, p3.x)), clip_box_d.x1);
+  double by1 = bl_min(bl_max(bl_max(p0.y, p1.y), bl_max(p2.y, p3.y)), clip_box_d.y1);
+
+  // Clipped out, degenerate, or invalid (NaN/Inf) coordinates.
+  if (!Math::is_finite(bx0, by0, bx1, by1) || !((bx0 < bx1) & (by0 < by1)))
+    return BL_SUCCESS;
+
+  // Integer device box that covers the fractional bounds (bounded by the clip box, which is
+  // always within the render target bounds, so the integers cannot overflow).
+  int ix0 = int(Math::floor(bx0));
+  int iy0 = int(Math::floor(by0));
+  int ix1 = int(Math::ceil(bx1));
+  int iy1 = int(Math::ceil(by1));
+
+  // Device -> user transformation, which maps device pixel centers to mask coordinates.
+  BLMatrix2D inv;
+  if (BLMatrix2D::invert(inv, t) != BL_SUCCESS)
+    return BL_SUCCESS;
+
+  BLImage tmp_image;
+  BL_PROPAGATE(tmp_image.create(ix1 - ix0, iy1 - iy0, BL_FORMAT_A8));
+
+  const BLImageImpl* mask_impl = ImageInternal::get_impl(mask);
+  const BLImageImpl* tmp_impl = ImageInternal::get_impl(&tmp_image);
+
+  const uint8_t* src_data = static_cast<const uint8_t*>(mask_impl->pixel_data);
+  intptr_t src_stride = mask_impl->stride;
+  uint32_t src_bpp = mask_impl->depth / 8u;
+
+  uint8_t* dst_data = static_cast<uint8_t*>(tmp_impl->pixel_data);
+  intptr_t dst_stride = tmp_impl->stride;
+
+  // Mask sampling bounds in mask pixel coordinates (exclusive).
+  int sx0 = mask_rect.x;
+  int sy0 = mask_rect.y;
+  int sx1 = mask_rect.x + mask_rect.w;
+  int sy1 = mask_rect.y + mask_rect.h;
+
+  // Offset that maps device coordinates to mask pixel coordinates (mask pixel centers are
+  // at `[i + 0.5, j + 0.5]`).
+  double map_x = inv.m20 - dst.x + double(sx0);
+  double map_y = inv.m21 - dst.y + double(sy0);
+
+  for (int y = iy0; y < iy1; y++) {
+    uint8_t* dst_row = dst_data + intptr_t(y - iy0) * dst_stride;
+
+    // Mask coordinates of the first pixel center of this row, advanced per pixel afterwards.
+    double mx = inv.m00 * (ix0 + 0.5) + inv.m10 * (y + 0.5) + map_x;
+    double my = inv.m01 * (ix0 + 0.5) + inv.m11 * (y + 0.5) + map_y;
+
+    // Vertical coverage of the fractional clip box of this row of pixels.
+    double cy = bl_min(y + 1.0, clip_box_d.y1) - bl_max(double(y), clip_box_d.y0);
+
+    for (int x = ix0; x < ix1; x++) {
+      // Horizontal coverage of the fractional clip box of this pixel.
+      double cx = bl_min(x + 1.0, clip_box_d.x1) - bl_max(double(x), clip_box_d.x0);
+      double coverage = cx * cy;
+
+      uint32_t v = 0;
+      if (coverage > 0.0) {
+        double fx = mx - 0.5;
+        double fy = my - 0.5;
+
+        int px = int(Math::floor(fx));
+        int py = int(Math::floor(fy));
+
+        fx -= double(px);
+        fy -= double(py);
+
+        uint32_t p00 = fetch_mask_byte_zero_padded(src_data, src_stride, src_bpp, px    , py    , sx0, sy0, sx1, sy1);
+        uint32_t p10 = fetch_mask_byte_zero_padded(src_data, src_stride, src_bpp, px + 1, py    , sx0, sy0, sx1, sy1);
+        uint32_t p01 = fetch_mask_byte_zero_padded(src_data, src_stride, src_bpp, px    , py + 1, sx0, sy0, sx1, sy1);
+        uint32_t p11 = fetch_mask_byte_zero_padded(src_data, src_stride, src_bpp, px + 1, py + 1, sx0, sy0, sx1, sy1);
+
+        double top = double(p00) + (double(p10) - double(p00)) * fx;
+        double bot = double(p01) + (double(p11) - double(p01)) * fx;
+
+        v = uint32_t((top + (bot - top) * fy) * coverage + 0.5);
+      }
+
+      dst_row[x - ix0] = uint8_t(v);
+      mx += inv.m00;
+      my += inv.m01;
+    }
+  }
+
+  return fill_clipped_box_masked_a<kRM>(ctx_impl, di, ds, BLBoxI(ix0, iy0, ix1, iy1), &tmp_image, BLPointI(0, 0));
+}
+
 template<RenderingMode kRM>
 static BL_INLINE BLResult fill_unclipped_mask_d(BLRasterContextImpl* ctx_impl, DispatchInfo di, DispatchStyle ds, BLPoint dst, const BLImageCore* mask, BLRectI mask_rect) noexcept {
   if (ctx_impl->final_transform_type() <= BL_TRANSFORM_TYPE_TRANSLATE) {
@@ -3620,59 +3751,21 @@ static BL_INLINE BLResult fill_unclipped_mask_d(BLRasterContextImpl* ctx_impl, D
       int tx = int(start_fx >> ctx_impl->render_target_info.fpShiftI);
       int ty = int(start_fy >> ctx_impl->render_target_info.fpShiftI);
 
-      mask_rect.x += x0 - tx;
-      mask_rect.y += y0 - ty;
-      mask_rect.w = x1 - x0;
-      mask_rect.h = y1 - y0;
+      BLRectI aligned_mask_rect(mask_rect);
+      aligned_mask_rect.x += x0 - tx;
+      aligned_mask_rect.y += y0 - ty;
 
       // Pixel aligned fill with a pixel aligned mask.
       if (isBoxAligned24x8(dst_box_u)) {
-        return fill_clipped_box_masked_a<kRM>(ctx_impl, di, ds, BLBoxI(x0, y0, x1, y1), mask, BLPointI(mask_rect.x, mask_rect.y));
+        return fill_clipped_box_masked_a<kRM>(ctx_impl, di, ds, BLBoxI(x0, y0, x1, y1), mask, BLPointI(aligned_mask_rect.x, aligned_mask_rect.y));
       }
-
-      // TODO: [Rendering Context] Masking support.
-      /*
-      BL_PROPAGATE(serializer.init_fetch_data_for_mask(ctx_impl));
-      serializer.mask_fetch_data()->init_image_source(mask, mask_rect);
-      if (!serializer.mask_fetch_data()->setup_pattern_blit(x0, y0))
-        return BL_SUCCESS;
-      */
-    }
-    else {
-      // TODO: [Rendering Context] Masking support.
-      /*
-      BL_PROPAGATE(serializer.init_fetch_data_for_mask(ctx_impl));
-      serializer.mask_fetch_data()->init_image_source(mask, mask_rect);
-      if (!serializer.mask_fetch_data()->setup_pattern_fx_fy(BL_RASTER_CONTEXT_PREFERRED_BLIT_EXTEND, ctx_impl->hints().pattern_quality, start_fx, start_fy))
-        return BL_SUCCESS;
-      */
-    }
-
-    /*
-    return fill_clipped_box_u<RenderCommandSerializerFlags::kMask>(ctx_impl, serializer, dst_box_u);
-    */
-  }
-
-  return bl_make_error(BL_ERROR_NOT_IMPLEMENTED);
-
-  // TODO: [Rendering Context] Masking support.
-  /*
-  else {
-    BLMatrix2D m(ctx_impl->final_transform());
-    m.translate(dst.x, dst.y);
-
-    BL_PROPAGATE(serializer.init_fetch_data_for_mask(ctx_impl));
-    serializer.mask_fetch_data()->init_image_source(mask, mask_rect);
-    if (!serializer.mask_fetch_data()->setup_pattern_affine(BL_RASTER_CONTEXT_PREFERRED_BLIT_EXTEND, ctx_impl->hints().pattern_quality, m)) {
-      serializer.rollback_fetch_data(ctx_impl);
-      return BL_SUCCESS;
     }
   }
 
-  BLBox final_box(dst.x, dst.y, dst.x + double(mask_rect.w), dst.y + double(mask_rect.h));
-  return bl_raster_context_impl_finalize_blit(ctx_impl, serializer,
-         fill_unclipped_box<RenderCommandSerializerFlags::kMask>(ctx_impl, serializer, final_box));
-  */
+  // The mask has a fractional origin, the final clip box is not pixel aligned, or the final
+  // transformation is complex (scaling, rotation, skewing, ...). Resample the mask into a
+  // temporary pixel-aligned A8 image and use the regular masked fill to composite it.
+  return fill_transformed_mask_d<kRM>(ctx_impl, di, ds, dst, mask, mask_rect);
 }
 
 template<RenderingMode kRM>

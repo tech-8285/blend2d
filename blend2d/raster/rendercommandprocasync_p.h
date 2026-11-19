@@ -213,7 +213,7 @@ static CommandStatus fillBoxMaskA(ProcData& proc_data, const RenderCommand& comm
     const uint8_t* mask_data = (static_cast<const uint8_t*>(mask_impl->pixel_data) + intptr_t(maskY) * mask_impl->stride) + maskX * (mask_impl->depth / 8u);
 
     Pipeline::MaskCommand mask_commands[2];
-    Pipeline::MaskCommandType vMaskCmd = command.alpha() >= 255 ? Pipeline::MaskCommandType::kVMaskA8WithoutGA : Pipeline::MaskCommandType::kVMaskA8WithGA;
+    Pipeline::MaskCommandType vMaskCmd = command.alpha() >= 255 ? Pipeline::MaskCommandType::kVMaskA8WithGA : Pipeline::MaskCommandType::kVMaskA8WithoutGA;
 
     mask_commands[0].init_vmask(vMaskCmd, uint32_t(box_i.x0), uint32_t(box_i.x1), mask_data, mask_impl->stride);
     mask_commands[1].init_repeat();

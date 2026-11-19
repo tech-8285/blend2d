@@ -587,12 +587,278 @@ static void test_context_blit_fill_clip(BLContext& ctx) {
   }
 }
 
+// bl::Context - Tests - Fill Mask
+// ===============================
+
+//! Deterministic mask content used by fill-mask tests - having a formula makes it possible to
+//! verify exact pixel values without storing the mask itself.
+static BL_INLINE uint32_t test_mask_value(int x, int y) noexcept {
+  return uint32_t((x * 8 + y * 7 + ((x ^ y) << 2)) & 0xFF);
+}
+
+static void create_test_mask_a8(BLImage& mask) noexcept {
+  EXPECT_SUCCESS(mask.create(32, 32, BL_FORMAT_A8));
+
+  BLImageData mask_data;
+  EXPECT_SUCCESS(mask.get_data(&mask_data));
+
+  for (int y = 0; y < 32; y++) {
+    uint8_t* row = static_cast<uint8_t*>(mask_data.pixel_data) + intptr_t(y) * mask_data.stride;
+    for (int x = 0; x < 32; x++)
+      row[x] = uint8_t(test_mask_value(x, y));
+  }
+}
+
+struct MaskFillTestOptions {
+  BLMatrix2D transform;
+  BLPoint origin;
+  double global_alpha;
+  BLCompOp comp_op;
+  BLRect clip_rect;
+  bool use_clip;
+};
+
+template<typename StyleT>
+static void render_mask_fill(BLImage& dst, uint32_t thread_count, const BLImage& mask, const StyleT& style, const MaskFillTestOptions& options) noexcept {
+  EXPECT_SUCCESS(dst.create(64, 64, BL_FORMAT_PRGB32));
+
+  BLContextCreateInfo cci {};
+  cci.thread_count = thread_count;
+
+  BLContext ctx;
+  EXPECT_SUCCESS(ctx.begin(dst, cci));
+
+  EXPECT_SUCCESS(ctx.clear_all());
+  if (options.use_clip)
+    EXPECT_SUCCESS(ctx.clip_to_rect(options.clip_rect));
+  EXPECT_SUCCESS(ctx.set_comp_op(options.comp_op));
+  EXPECT_SUCCESS(ctx.set_global_alpha(options.global_alpha));
+  EXPECT_SUCCESS(ctx.set_transform(options.transform));
+  EXPECT_SUCCESS(ctx.fill_mask(options.origin, mask, style));
+  EXPECT_SUCCESS(ctx.end());
+}
+
+static bool images_identical(const BLImage& a, const BLImage& b) noexcept {
+  BLImageData data_a;
+  BLImageData data_b;
+
+  if (a.get_data(&data_a) != BL_SUCCESS || b.get_data(&data_b) != BL_SUCCESS)
+    return false;
+
+  if (data_a.size != data_b.size)
+    return false;
+
+  for (int y = 0; y < data_a.size.h; y++) {
+    const uint8_t* row_a = static_cast<const uint8_t*>(data_a.pixel_data) + intptr_t(y) * data_a.stride;
+    const uint8_t* row_b = static_cast<const uint8_t*>(data_b.pixel_data) + intptr_t(y) * data_b.stride;
+
+    if (memcmp(row_a, row_b, size_t(data_a.size.w) * 4u) != 0)
+      return false;
+  }
+
+  return true;
+}
+
+static bool image_is_blank(const BLImage& img) noexcept {
+  BLImageData data;
+  if (img.get_data(&data) != BL_SUCCESS)
+    return true;
+
+  for (int y = 0; y < data.size.h; y++) {
+    const uint32_t* row = reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(data.pixel_data) + intptr_t(y) * data.stride);
+    for (int x = 0; x < data.size.w; x++) {
+      if (row[x] != 0u)
+        return false;
+    }
+  }
+
+  return true;
+}
+
+static uint32_t get_prgb32_alpha(const BLImage& img, int x, int y) noexcept {
+  BLImageData data;
+  EXPECT_SUCCESS(img.get_data(&data));
+
+  const uint32_t* row = reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(data.pixel_data) + intptr_t(y) * data.stride);
+  return row[x] >> 24;
+}
+
+static void test_context_fill_mask() {
+  BLImage mask;
+  create_test_mask_a8(mask);
+
+  MaskFillTestOptions opt {};
+  opt.transform = BLMatrix2D::make_identity();
+  opt.origin = BLPoint(8.0, 8.0);
+  opt.global_alpha = 1.0;
+  opt.comp_op = BL_COMP_OP_SRC_OVER;
+  opt.use_clip = false;
+
+  INFO("Testing fill_mask() with a pixel-aligned origin (existing behavior must be preserved)");
+  {
+    BLImage sync_img;
+    BLImage mt_img;
+    render_mask_fill(sync_img, 0, mask, BLRgba32(0xFFFFFFFFu), opt);
+    render_mask_fill(mt_img, 4, mask, BLRgba32(0xFFFFFFFFu), opt);
+
+    // Synchronous and multi-threaded rendering must produce identical results.
+    EXPECT_TRUE(images_identical(sync_img, mt_img));
+
+    // With an opaque white style composited by SRC_OVER over a cleared target, the alpha of
+    // an interior pixel must be equal to the mask value at the corresponding position.
+    EXPECT_EQ(get_prgb32_alpha(sync_img, 12, 20), test_mask_value(4, 12));
+    EXPECT_EQ(get_prgb32_alpha(sync_img, 30, 30), test_mask_value(22, 22));
+  }
+
+  INFO("Testing fill_mask() with fractional origins (edges must follow the origin continuously)");
+  {
+    BLImage prev_img;
+    for (uint32_t i = 0; i <= 4u; i++) {
+      opt.origin = BLPoint(8.0 + 0.25 * double(i), 8.0);
+
+      BLImage sync_img;
+      BLImage mt_img;
+      render_mask_fill(sync_img, 0, mask, BLRgba32(0xFFFFFFFFu), opt);
+      render_mask_fill(mt_img, 4, mask, BLRgba32(0xFFFFFFFFu), opt);
+
+      EXPECT_TRUE(images_identical(sync_img, mt_img));
+      if (i != 0u)
+        EXPECT_FALSE(images_identical(prev_img, sync_img));
+
+      prev_img = sync_img;
+    }
+
+    // A quarter-pixel shift produces a predictable blend of the two neighboring mask values.
+    opt.origin = BLPoint(8.25, 8.0);
+    BLImage shifted_img;
+    render_mask_fill(shifted_img, 0, mask, BLRgba32(0xFFFFFFFFu), opt);
+
+    uint32_t m0 = test_mask_value(3, 12);
+    uint32_t m1 = test_mask_value(4, 12);
+    EXPECT_EQ(get_prgb32_alpha(shifted_img, 12, 20), (m0 + m1 * 3u + 2u) / 4u);
+  }
+
+  INFO("Testing fill_mask() with complex transformations (scale, rotate, skew)");
+  {
+    BLMatrix2D transforms[] = {
+      BLMatrix2D::make_scaling(1.7, 0.6),
+      BLMatrix2D::make_rotation(0.4, 24.0, 24.0),
+      BLMatrix2D(1.0, 0.3, -0.2, 1.0, 0.0, 0.0)
+    };
+
+    opt.origin = BLPoint(12.0, 12.0);
+
+    for (size_t i = 0; i < BL_ARRAY_SIZE(transforms); i++) {
+      opt.transform = transforms[i];
+
+      BLImage sync_img;
+      BLImage mt_img;
+      render_mask_fill(sync_img, 0, mask, BLRgba32(0xFFFFFFFFu), opt);
+      render_mask_fill(mt_img, 4, mask, BLRgba32(0xFFFFFFFFu), opt);
+
+      EXPECT_TRUE(images_identical(sync_img, mt_img));
+      EXPECT_FALSE(image_is_blank(sync_img));
+    }
+  }
+
+  INFO("Testing fill_mask() clipped by a non-pixel-aligned clip box");
+  {
+    opt.transform = BLMatrix2D::make_identity();
+    opt.origin = BLPoint(8.0, 8.0);
+    opt.use_clip = true;
+    opt.clip_rect = BLRect(10.5, 10.5, 25.0, 25.0); // Clip box [10.5, 10.5, 35.5, 35.5].
+
+    BLImage sync_img;
+    BLImage mt_img;
+    render_mask_fill(sync_img, 0, mask, BLRgba32(0xFFFFFFFFu), opt);
+    render_mask_fill(mt_img, 4, mask, BLRgba32(0xFFFFFFFFu), opt);
+
+    EXPECT_TRUE(images_identical(sync_img, mt_img));
+
+    // Fully covered interior pixel - alpha equals the mask value.
+    EXPECT_EQ(get_prgb32_alpha(sync_img, 20, 20), test_mask_value(12, 12));
+
+    // Half-covered edge pixels - alpha equals half of the mask value (rounded).
+    EXPECT_EQ(get_prgb32_alpha(sync_img, 10, 20), (test_mask_value(2, 12) + 1u) / 2u);
+    EXPECT_EQ(get_prgb32_alpha(sync_img, 20, 10), (test_mask_value(12, 2) + 1u) / 2u);
+
+    // Quarter-covered corner pixel.
+    EXPECT_EQ(get_prgb32_alpha(sync_img, 10, 10), (test_mask_value(2, 2) + 2u) / 4u);
+
+    // Pixels outside of the clip box must stay untouched.
+    EXPECT_EQ(get_prgb32_alpha(sync_img, 9, 20), 0u);
+    EXPECT_EQ(get_prgb32_alpha(sync_img, 36, 20), 0u);
+
+    opt.use_clip = false;
+  }
+
+  INFO("Testing fill_mask() with solid, gradient, and pattern styles combined with global alpha and comp-op");
+  {
+    BLGradient gradient;
+    EXPECT_SUCCESS(gradient.create(BLLinearGradientValues(0.0, 0.0, 64.0, 64.0)));
+    EXPECT_SUCCESS(gradient.add_stop(0.0, BLRgba32(0xFFFF0000u)));
+    EXPECT_SUCCESS(gradient.add_stop(1.0, BLRgba32(0xFF0000FFu)));
+
+    BLImage pattern_img;
+    EXPECT_SUCCESS(pattern_img.create(8, 8, BL_FORMAT_PRGB32));
+    {
+      BLContext pattern_ctx(pattern_img);
+      EXPECT_SUCCESS(pattern_ctx.set_fill_style(BLRgba32(0xFF00FF00u)));
+      EXPECT_SUCCESS(pattern_ctx.fill_all());
+      EXPECT_SUCCESS(pattern_ctx.end());
+    }
+    BLPattern pattern(pattern_img);
+
+    opt.transform = BLMatrix2D::make_rotation(0.25, 24.0, 24.0);
+    opt.origin = BLPoint(10.0, 10.0);
+    opt.global_alpha = 0.75;
+
+    // NOTE: The static (non-JIT) pipeline only implements SRC_OVER and SRC_COPY composition
+    // operators, other operators are only available in JIT builds.
+    BLCompOp comp_ops[] = { BL_COMP_OP_SRC_OVER, BL_COMP_OP_SRC_COPY };
+
+    for (size_t i = 0; i < BL_ARRAY_SIZE(comp_ops); i++) {
+      opt.comp_op = comp_ops[i];
+
+      BLImage sync_img;
+      BLImage mt_img;
+
+      render_mask_fill(sync_img, 0, mask, BLRgba32(0xFF112233u), opt);
+      render_mask_fill(mt_img, 4, mask, BLRgba32(0xFF112233u), opt);
+      EXPECT_TRUE(images_identical(sync_img, mt_img));
+
+      render_mask_fill(sync_img, 0, mask, gradient, opt);
+      render_mask_fill(mt_img, 4, mask, gradient, opt);
+      EXPECT_TRUE(images_identical(sync_img, mt_img));
+
+      render_mask_fill(sync_img, 0, mask, pattern, opt);
+      render_mask_fill(mt_img, 4, mask, pattern, opt);
+      EXPECT_TRUE(images_identical(sync_img, mt_img));
+    }
+
+    // Global alpha must scale the resulting alpha of mask-filled pixels.
+    opt.transform = BLMatrix2D::make_identity();
+    opt.origin = BLPoint(8.0, 8.0);
+    opt.global_alpha = 0.5;
+    opt.comp_op = BL_COMP_OP_SRC_OVER;
+
+    BLImage alpha_img;
+    render_mask_fill(alpha_img, 0, mask, BLRgba32(0xFFFFFFFFu), opt);
+
+    uint32_t m = test_mask_value(4, 12);
+    uint32_t expected_alpha = (m * 128u + 127u) / 255u;
+    uint32_t actual_alpha = get_prgb32_alpha(alpha_img, 12, 20);
+    EXPECT_TRUE(actual_alpha + 1u >= expected_alpha && actual_alpha <= expected_alpha + 1u);
+  }
+}
+
 UNIT(context, BL_TEST_GROUP_RENDERING_CONTEXT) {
   BLImage img(256, 256, BL_FORMAT_PRGB32);
   BLContext ctx(img);
 
   test_context_state(ctx);
   test_context_blit_fill_clip(ctx);
+  test_context_fill_mask();
 }
 
 } // {Tests}
